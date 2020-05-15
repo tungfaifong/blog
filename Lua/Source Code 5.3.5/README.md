@@ -322,14 +322,104 @@ table的实现主要分为两个部分，一个部分是数组部分，另外一
 
 ##### function：
 
-todo
+```c
+// lobject.h
+
+/*
+** Closures
+*/
+
+#define ClosureHeader \
+	CommonHeader; lu_byte nupvalues; GCObject *gclist
+
+typedef struct CClosure {
+  ClosureHeader;
+  lua_CFunction f;
+  TValue upvalue[1];  /* list of upvalues */
+} CClosure;
+
+typedef struct LClosure {
+  ClosureHeader;
+  struct Proto *p;
+  UpVal *upvals[1];  /* list of upvalues */
+} LClosure;
+
+typedef union Closure {
+  CClosure c;
+  LClosure l;
+} Closure;
+```
+
+```c
+// lfunc.h
+
+/*
+** Upvalues for Lua closures
+*/
+struct UpVal {
+  TValue *v;  /* points to stack or to its own value */
+  lu_mem refcount;  /* reference counter */
+  union {
+    struct {  /* (when open) */
+      UpVal *next;  /* linked list */
+      int touched;  /* mark to avoid cycles with dead threads */
+    } open;
+    TValue value;  /* the value (when closed) */
+  } u;
+};
+```
+
+Lua用一种成为upvalue的结构来实现闭包。对任何外层局部变量的存取间接通过upvalue来进行。upvalue最初指向栈中变量活跃的地方。当离开变量作用域的时候（超过变量生存期），变量被复制到upvalue中。
+
+Lua针对每个变量，至少创建一个upvalue并按情况进行重复利用。Lua为整个运行栈保存了一个链表将所有upvalue都存起来。当一个新的闭包创建的时候，会先去遍历这个链表查看是不是有相对应的upvalue，若存在则直接使用，若不存在则创建一个新的upvalue并加入链表。当这个upvalue关闭后则从链表中删除，当所有闭包都不使用这个upvalue时，那它的储存空间则马上被释放。
+
+在Lua中我们function区分了三个变种类型Lua闭包、纯C函数、C闭包，纯C函数我们可以看到Value中直接用f使用，而Lua闭包和C闭包有独立的结构体。首先我们可以看到两种闭包结构都会有一个闭包头ClosureHeader，ClosureHeader中有CommonHeader、表示上值数的nupvalues、和gc相关的gclist。
+
+CClosure这个结构表示了C闭包的结构，这个结构首先包含了一个闭包头，紧接着一个lua_CFunction类型的f指向真正的c函数，upvalue代表上值的链表。
+
+LClosure这个结构表示了Lua的闭包，首先还是具有一个闭包头，紧接着是一个原型类型的指针p，upvals代表上值的链表。
+
+最后是一个统一的闭包联合结构。
 
 ##### thread：
 
-
-
 ```c
 // lstate.h
+
+typedef struct stringtable {
+  TString **hash;
+  int nuse;  /* number of elements */
+  int size;
+} stringtable;
+
+/*
+** Information about a call.
+** When a thread yields, 'func' is adjusted to pretend that the
+** top function has only the yielded values in its stack; in that
+** case, the actual 'func' value is saved in field 'extra'.
+** When a function calls another with a continuation, 'extra' keeps
+** the function index so that, in case of errors, the continuation
+** function can be called with the correct top.
+*/
+typedef struct CallInfo {
+  StkId func;  /* function index in the stack */
+  StkId	top;  /* top for this function */
+  struct CallInfo *previous, *next;  /* dynamic call link */
+  union {
+    struct {  /* only for Lua functions */
+      StkId base;  /* base for this function */
+      const Instruction *savedpc;
+    } l;
+    struct {  /* only for C functions */
+      lua_KFunction k;  /* continuation in case of yields */
+      ptrdiff_t old_errfunc;
+      lua_KContext ctx;  /* context info. in case of yields */
+    } c;
+  } u;
+  ptrdiff_t extra;
+  short nresults;  /* expected number of results from this function */
+  unsigned short callstatus;
+} CallInfo;
 
 /*
 ** 'global state', shared by all threads of this state
@@ -370,7 +460,44 @@ typedef struct global_State {
   struct Table *mt[LUA_NUMTAGS];  /* 所有基本类型的metatable - metatables for basic types */
   TString *strcache[STRCACHE_N][STRCACHE_M];  /* 字符串缓存，存储长字符串 cache for strings in API */
 } global_State;
+
+/*
+** 'per thread' state
+*/
+struct lua_State {
+  CommonHeader;
+  unsigned short nci;  /* number of items in 'ci' list */
+  lu_byte status;
+  StkId top;  /* first free slot in the stack */
+  global_State *l_G;
+  CallInfo *ci;  /* call info for current function */
+  const Instruction *oldpc;  /* last pc traced */
+  StkId stack_last;  /* last free slot in the stack */
+  StkId stack;  /* stack base */
+  UpVal *openupval;  /* list of open upvalues in this stack */
+  GCObject *gclist;
+  struct lua_State *twups;  /* list of threads with open upvalues */
+  struct lua_longjmp *errorJmp;  /* current error recover point */
+  CallInfo base_ci;  /* CallInfo for first level (C calling Lua) */
+  volatile lua_Hook hook;
+  ptrdiff_t errfunc;  /* current error handling function (stack index) */
+  int stacksize;
+  int basehookcount;
+  int hookcount;
+  unsigned short nny;  /* number of non-yieldable calls in stack */
+  unsigned short nCcalls;  /* number of nested C calls */
+  l_signalT hookmask;
+  lu_byte allowhook;
+};
 ```
+
+在Lua中thread类型代表的是协程类型，在每个协程中（lua_State）Lua具有两个栈（一个数据栈、一个调用栈），这样我们就可以在多级函数嵌套调用内挂起一个协程。
+
+首先我们先在看下lua_State的结构，lua_State的成员比较多我们在这里先看看一些与调用相关的。
+
+首先我们看看调用栈，在lua_State中调用栈是用一个CallInfo组成的双向链表来构成，在lua_State中ci指向调用栈的顶部，base_ci是调用栈的底部。
+
+而数据栈则是采用数组才实现，stack指向堆栈的底部，stack_last指向最后一个空闲的栈空间，top指向栈顶，同样在CallInfo中也保存了调用的数据栈情况，fun指向的是该函数堆栈的开始，top是当前栈的顶部，base代表的是栈基址[func, base]代表的是可变参数，[base, top]是固定参数和本地变量。
 
 #### 三、Lua主流程
 
@@ -410,6 +537,4 @@ int main (int argc, char **argv) {
 6.通过lua_close(L)关闭lua状态机。
 
 接下来我们看下每一步中，代码都做了些什么。
-
-#### 
 
