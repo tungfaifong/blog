@@ -785,3 +785,65 @@ static void doREPL (lua_State *L) {
 }
 ```
 
+从doREPL中可以看到整个交互式解释器就是通过一个死循环不断通过loadline读入代码，然后再调用docall执行代码。
+
+loadline的调用顺序：loadline->addreturn(or multiline)->luaL_loadbuffer->luaL_loadbufferx->lua_load->luaD_protectedparser->f_parser。
+
+```c
+// ldo.c
+
+static void f_parser (lua_State *L, void *ud) {
+  LClosure *cl;
+  struct SParser *p = cast(struct SParser *, ud);
+  int c = zgetc(p->z);  /* read first character */
+  if (c == LUA_SIGNATURE[0]) {
+    checkmode(L, p->mode, "binary");
+    cl = luaU_undump(L, p->z, p->name);
+  }
+  else {
+    checkmode(L, p->mode, "text");
+    cl = luaY_parser(L, p->z, &p->buff, &p->dyd, p->name, c);
+  }
+  lua_assert(cl->nupvalues == cl->p->sizeupvalues);
+  luaF_initupvals(L, cl);
+}
+```
+
+在f_parser中会去判断读入的数据是二进制数据还是文本数据，再分别通过luaU_undump和luaY_parser做解析。这里我们看下luaY_parser做了些什么。
+
+```c
+// lparser.c
+
+LClosure *luaY_parser (lua_State *L, ZIO *z, Mbuffer *buff,
+                       Dyndata *dyd, const char *name, int firstchar) {
+  LexState lexstate;
+  FuncState funcstate;
+  LClosure *cl = luaF_newLclosure(L, 1);  /* create main closure */
+  setclLvalue(L, L->top, cl);  /* anchor it (to avoid being collected) */
+  luaD_inctop(L);
+  lexstate.h = luaH_new(L);  /* create table for scanner */
+  sethvalue(L, L->top, lexstate.h);  /* anchor it */
+  luaD_inctop(L);
+  funcstate.f = cl->p = luaF_newproto(L);
+  funcstate.f->source = luaS_new(L, name);  /* create and anchor TString */
+  lua_assert(iswhite(funcstate.f));  /* do not need barrier here */
+  lexstate.buff = buff;
+  lexstate.dyd = dyd;
+  dyd->actvar.n = dyd->gt.n = dyd->label.n = 0;
+  luaX_setinput(L, &lexstate, z, funcstate.f->source, firstchar);
+  mainfunc(&lexstate, &funcstate);
+  lua_assert(!funcstate.prev && funcstate.nups == 1 && !lexstate.fs);
+  /* all scopes should be correctly finished */
+  lua_assert(dyd->actvar.n == 0 && dyd->gt.n == 0 && dyd->label.n == 0);
+  L->top--;  /* remove scanner's table */
+  return cl;  /* closure is on the stack, too */
+}
+```
+
+当我们读入一段代码的时候parser会先创建一个LClosure放入lua_State的数据栈中同时会创建一个Proto，然后针对输入的内容进行词法分析和语法分析，此处我们不深入去看词法分析器和语法分析器做了什么，我们通过语法分析和词法分析之后会向Proto中放入一系列分析后的指令。
+
+然后我们再看来下docall，docall的流程和上面提到pmain的调用顺序是一样的，最后还是会调用到luaD_call，生成一个ci之后通过Lua的虚拟机执行刚刚解析得出的指令。
+
+#### 四、虚拟机
+
+##### 虚拟机指令：
