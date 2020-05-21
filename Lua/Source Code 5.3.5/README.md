@@ -49,7 +49,7 @@
   | ------------- | ----------------------------------------- |
   | lapi.h/lapi.c | Lua API，实现了大部分Lua C API(lua_*函数) |
 
-  - ###### 通用函数：
+  - ###### 其他：
 
   | 文件              | 作用                               |
   | ----------------- | ---------------------------------- |
@@ -537,4 +537,251 @@ int main (int argc, char **argv) {
 6.通过lua_close(L)关闭lua状态机。
 
 接下来我们看下每一步中，代码都做了些什么。
+
+首先我们先看下第一步创建Lua状态机的luaL_newstate：
+
+```c
+// lauxlib.c
+
+static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
+  (void)ud; (void)osize;  /* not used */
+  if (nsize == 0) {
+    free(ptr);
+    return NULL;
+  }
+  else
+    return realloc(ptr, nsize);
+}
+
+static int panic (lua_State *L) {
+  lua_writestringerror("PANIC: unprotected error in call to Lua API (%s)\n",
+                        lua_tostring(L, -1));
+  return 0;  /* return to Lua to abort */
+}
+
+LUALIB_API lua_State *luaL_newstate (void) {
+  lua_State *L = lua_newstate(l_alloc, NULL);
+  if (L) lua_atpanic(L, &panic);
+  return L;
+}
+```
+
+luaL_newstate对lua_newstate做了一个封装指定了一个默认的内存分配器，默认的内存分配是直接调用C的realloc和free来做内存分配和释放。lua状态创建过程是在lua_newstate中：
+
+```c
+// lua_state.c
+
+LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
+  int i;
+  lua_State *L;
+  global_State *g;
+  LG *l = cast(LG *, (*f)(ud, NULL, LUA_TTHREAD, sizeof(LG)));
+  if (l == NULL) return NULL;
+  L = &l->l.l;
+  g = &l->g;
+  L->next = NULL;
+  L->tt = LUA_TTHREAD;
+  g->currentwhite = bitmask(WHITE0BIT);
+  L->marked = luaC_white(g);
+  preinit_thread(L, g);
+  g->frealloc = f;
+  g->ud = ud;
+  g->mainthread = L;
+  g->seed = makeseed(L);
+  g->gcrunning = 0;  /* no GC while building state */
+  g->GCestimate = 0;
+  g->strt.size = g->strt.nuse = 0;
+  g->strt.hash = NULL;
+  setnilvalue(&g->l_registry);
+  g->panic = NULL;
+  g->version = NULL;
+  g->gcstate = GCSpause;
+  g->gckind = KGC_NORMAL;
+  g->allgc = g->finobj = g->tobefnz = g->fixedgc = NULL;
+  g->sweepgc = NULL;
+  g->gray = g->grayagain = NULL;
+  g->weak = g->ephemeron = g->allweak = NULL;
+  g->twups = NULL;
+  g->totalbytes = sizeof(LG);
+  g->GCdebt = 0;
+  g->gcfinnum = 0;
+  g->gcpause = LUAI_GCPAUSE;
+  g->gcstepmul = LUAI_GCMUL;
+  for (i=0; i < LUA_NUMTAGS; i++) g->mt[i] = NULL;
+  if (luaD_rawrunprotected(L, f_luaopen, NULL) != LUA_OK) {
+    /* memory allocation error: free partial state */
+    close_state(L);
+    L = NULL;
+  }
+  return L;
+}
+```
+
+调用lua_newstate的时候会创建一个global_State和一个lua_State作为global_State的mainthread，接下来的其他动作主要都是对global_State和lua_State的初始化，其中我们来看下对lua_State初始化的f_luaopen部分。
+
+```c
+// lstate.c
+
+/*
+** open parts of the state that may cause memory-allocation errors.
+** ('g->version' != NULL flags that the state was completely build)
+*/
+static void f_luaopen (lua_State *L, void *ud) {
+  global_State *g = G(L);
+  UNUSED(ud);
+  stack_init(L, L);  /* init stack */
+  init_registry(L, g);
+  luaS_init(L);
+  luaT_init(L);
+  luaX_init(L);
+  g->gcrunning = 1;  /* allow gc */
+  g->version = lua_version(NULL);
+  luai_userstateopen(L);
+}
+```
+
+其中stack_init(L, L)对lua_State中的数据栈和调用栈进行了初始化、init_registry(L, g)针对全局的注册表进行了初始化、luaS_init(L)对string相关内容进行了初始化、lusT_init(L)对元表相关内容进行初始化、luaX_init(L)对词法分析器进行初始化、最后全部初始化完成后再对g设置一个version，将状态机标记为初始化完成。
+
+```c
+// lstate.c
+
+static void stack_init (lua_State *L1, lua_State *L) {
+  int i; CallInfo *ci;
+  /* initialize stack array */
+  L1->stack = luaM_newvector(L, BASIC_STACK_SIZE, TValue);
+  L1->stacksize = BASIC_STACK_SIZE;
+  for (i = 0; i < BASIC_STACK_SIZE; i++)
+    setnilvalue(L1->stack + i);  /* erase new stack */
+  L1->top = L1->stack;
+  L1->stack_last = L1->stack + L1->stacksize - EXTRA_STACK;
+  /* initialize first ci */
+  ci = &L1->base_ci;
+  ci->next = ci->previous = NULL;
+  ci->callstatus = 0;
+  ci->func = L1->top;
+  setnilvalue(L1->top++);  /* 'function' entry for this 'ci' */
+  ci->top = L1->top + LUA_MINSTACK;
+  L1->ci = ci;
+}
+```
+
+stack_init中可以看到lua_State中stack数据栈是直接采用数组的方式进行组织，而调用栈ci则是采用双向链表的方式进行组织。
+
+```c
+// lstate.c
+
+/*
+** Create registry table and its predefined values
+*/
+static void init_registry (lua_State *L, global_State *g) {
+  TValue temp;
+  /* create registry */
+  Table *registry = luaH_new(L);
+  sethvalue(L, &g->l_registry, registry);
+  luaH_resize(L, registry, LUA_RIDX_LAST, 0);
+  /* registry[LUA_RIDX_MAINTHREAD] = L */
+  setthvalue(L, &temp, L);  /* temp = L */
+  luaH_setint(L, registry, LUA_RIDX_MAINTHREAD, &temp);
+  /* registry[LUA_RIDX_GLOBALS] = table of globals */
+  sethvalue(L, &temp, luaH_new(L));  /* temp = new table (global table) */
+  luaH_setint(L, registry, LUA_RIDX_GLOBALS, &temp);
+}
+```
+
+接下来是初始化注册表，在init_registry中我们可以看到，首先是申请了一个新的table对象，将g的l_registry设为改新的table，而后在新的l_registry中插入两个对象，在l_registry[1]中放入lua_State对象L，在l_registry[2]中放入一个新的全局变量table。
+
+```c
+// lstring.c
+
+/*
+** Initialize the string table and the string cache
+*/
+void luaS_init (lua_State *L) {
+  global_State *g = G(L);
+  int i, j;
+  luaS_resize(L, MINSTRTABSIZE);  /* initial size of string table */
+  /* pre-create memory-error message */
+  g->memerrmsg = luaS_newliteral(L, MEMERRMSG);
+  luaC_fix(L, obj2gco(g->memerrmsg));  /* it should never be collected */
+  for (i = 0; i < STRCACHE_N; i++)  /* fill cache with valid strings */
+    for (j = 0; j < STRCACHE_M; j++)
+      g->strcache[i][j] = g->memerrmsg;
+}
+```
+
+luaS_init主要是用来初始化在global_State中string相关的内容，首先luaS_resize的时候会先给global_State中的stringtable分配一个初始大小的数组，然后同时将strcache全部初始化为无效的字符串。
+
+```c
+// ltm.c
+
+void luaT_init (lua_State *L) {
+  static const char *const luaT_eventname[] = {  /* ORDER TM */
+    "__index", "__newindex",
+    "__gc", "__mode", "__len", "__eq",
+    "__add", "__sub", "__mul", "__mod", "__pow",
+    "__div", "__idiv",
+    "__band", "__bor", "__bxor", "__shl", "__shr",
+    "__unm", "__bnot", "__lt", "__le",
+    "__concat", "__call"
+  };
+  int i;
+  for (i=0; i<TM_N; i++) {
+    G(L)->tmname[i] = luaS_new(L, luaT_eventname[i]);
+    luaC_fix(L, obj2gco(G(L)->tmname[i]));  /* never collect these names */
+  }
+}
+```
+
+luaT_init主要是初始化global_State中tmname数组，初始化元表会用到的内置函数。
+
+在所有内容初始化完成之后将mainthread返回出去。
+
+创建完Lua状态机之后，2、3步分别是将pmain函数和使用到的参数相关的内容push到lua_State的栈中（见lapi.c），然后在第4步中调用lua_pcall来调用pmain函数。
+
+lua_pcall的调用顺序：lua_pcall->lua_pcallk->luaD_pcall->f_call->luaD_callnoyield->luaD_call。
+
+```c
+// ldo.c
+
+/*
+** Call a function (C or Lua). The function to be called is at *func.
+** The arguments are on the stack, right after the function.
+** When returns, all the results are on the stack, starting at the original
+** function position.
+*/
+void luaD_call (lua_State *L, StkId func, int nResults) {
+  if (++L->nCcalls >= LUAI_MAXCCALLS)
+    stackerror(L);
+  if (!luaD_precall(L, func, nResults))  /* is a Lua function? */
+    luaV_execute(L);  /* call it */
+  L->nCcalls--;
+}
+```
+
+在Lua中调用一个函数，最后都会走到luaD_call这个函数中，我们可以看到这个函数，首先会调用luaD_precall，在luaD_precall中回去判断该调用的函数是那种类型的Closure，如果是C闭包或者C函数那就会直接调用，如果是Lua闭包则返回，等待luaV_execute执行，在luaD_precall中，会创建一个新的callinfo放到lua_State的ci链表中。
+
+接下来我们看下在pmain函数中的doREPL函数，doREPL主要是lua.c编译出来之后交互式解释器的主要的一个函数，我们借此来看下lua代码是怎么被执行的。
+
+```c
+// lua.c
+
+/*
+** Do the REPL: repeatedly read (load) a line, evaluate (call) it, and
+** print any results.
+*/
+static void doREPL (lua_State *L) {
+  int status;
+  const char *oldprogname = progname;
+  progname = NULL;  /* no 'progname' on errors in interactive mode */
+  while ((status = loadline(L)) != -1) {
+    if (status == LUA_OK)
+      status = docall(L, 0, LUA_MULTRET);
+    if (status == LUA_OK) l_print(L);
+    else report(L, status);
+  }
+  lua_settop(L, 0);  /* clear stack */
+  lua_writeline();
+  progname = oldprogname;
+}
+```
 
