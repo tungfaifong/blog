@@ -846,4 +846,129 @@ LClosure *luaY_parser (lua_State *L, ZIO *z, Mbuffer *buff,
 
 #### 四、虚拟机
 
+现有主流的虚拟机主要是基于栈或者基于寄存器来实现，基于栈的虚拟机有JVM、CPython等，而基于寄存器的主要是Lua等。
+
+基于栈的虚拟机主要是实现了一个操作栈，所有操作都在栈上执行，特点是实现方便，但是由于大量指令操作速度会比较慢。
+
+基于寄存器的主要实现方式，则是一条指令中包含了操作和寄存器的地址，在一条指令中实现一个操作，基于寄存器的指令更为简洁，不过实现会更为复杂。
+
+举一个例子：a = b + c
+
+```
+// 基于栈
+I1:LOAD C
+I2:LOAD B
+I3:ADD
+I4:STORE A
+
+// 基于寄存器
+I1:ADD A B C
+```
+
+可以看到基于栈的虚拟机指令会比基于寄存器的虚拟机更多。
+
 ##### 虚拟机指令：
+
+Lua的虚拟机指令将32位分为2个、3个或4个域，如下：
+
+```
+|6	|8	|9	|9	|
+|OP	|A	|B	|C	|
+|OP	|A	|Bx		|
+|OP	|A	|sBx	|
+|OP	|Ax			|
+```
+
+OP域占6位，代表了指令的操作数。A域是一定存在的占8位，B、C域各占9位。B、C域可以组合成一个18位的Bx域（无符号）或sBx域（有符号），A、B、C可以组成一个26位的Ax域。
+
+大部分指令使用三地址格式，其中A代表目的寄存器；B、C分别代表源操作数，可以是寄存器或常数。
+
+```c
+// lopcodes.h
+
+/*
+** R(x) - register
+** Kst(x) - constant (in constant table)
+** RK(x) == if ISK(x) then Kst(INDEXK(x)) else R(x)
+*/
+
+/*
+** grep "ORDER OP" if you change these enums
+*/
+
+typedef enum {
+/*----------------------------------------------------------------------
+name		args	description
+------------------------------------------------------------------------*/
+OP_MOVE,/*	A B	R(A) := R(B)					*/
+OP_LOADK,/*	A Bx	R(A) := Kst(Bx)					*/
+OP_LOADKX,/*	A 	R(A) := Kst(extra arg)				*/
+OP_LOADBOOL,/*	A B C	R(A) := (Bool)B; if (C) pc++			*/
+OP_LOADNIL,/*	A B	R(A), R(A+1), ..., R(A+B) := nil		*/
+OP_GETUPVAL,/*	A B	R(A) := UpValue[B]				*/
+
+OP_GETTABUP,/*	A B C	R(A) := UpValue[B][RK(C)]			*/
+OP_GETTABLE,/*	A B C	R(A) := R(B)[RK(C)]				*/
+
+OP_SETTABUP,/*	A B C	UpValue[A][RK(B)] := RK(C)			*/
+OP_SETUPVAL,/*	A B	UpValue[B] := R(A)				*/
+OP_SETTABLE,/*	A B C	R(A)[RK(B)] := RK(C)				*/
+
+OP_NEWTABLE,/*	A B C	R(A) := {} (size = B,C)				*/
+
+OP_SELF,/*	A B C	R(A+1) := R(B); R(A) := R(B)[RK(C)]		*/
+
+OP_ADD,/*	A B C	R(A) := RK(B) + RK(C)				*/
+OP_SUB,/*	A B C	R(A) := RK(B) - RK(C)				*/
+OP_MUL,/*	A B C	R(A) := RK(B) * RK(C)				*/
+OP_MOD,/*	A B C	R(A) := RK(B) % RK(C)				*/
+OP_POW,/*	A B C	R(A) := RK(B) ^ RK(C)				*/
+OP_DIV,/*	A B C	R(A) := RK(B) / RK(C)				*/
+OP_IDIV,/*	A B C	R(A) := RK(B) // RK(C)				*/
+OP_BAND,/*	A B C	R(A) := RK(B) & RK(C)				*/
+OP_BOR,/*	A B C	R(A) := RK(B) | RK(C)				*/
+OP_BXOR,/*	A B C	R(A) := RK(B) ~ RK(C)				*/
+OP_SHL,/*	A B C	R(A) := RK(B) << RK(C)				*/
+OP_SHR,/*	A B C	R(A) := RK(B) >> RK(C)				*/
+OP_UNM,/*	A B	R(A) := -R(B)					*/
+OP_BNOT,/*	A B	R(A) := ~R(B)					*/
+OP_NOT,/*	A B	R(A) := not R(B)				*/
+OP_LEN,/*	A B	R(A) := length of R(B)				*/
+
+OP_CONCAT,/*	A B C	R(A) := R(B).. ... ..R(C)			*/
+
+OP_JMP,/*	A sBx	pc+=sBx; if (A) close all upvalues >= R(A - 1)	*/
+OP_EQ,/*	A B C	if ((RK(B) == RK(C)) ~= A) then pc++		*/
+OP_LT,/*	A B C	if ((RK(B) <  RK(C)) ~= A) then pc++		*/
+OP_LE,/*	A B C	if ((RK(B) <= RK(C)) ~= A) then pc++		*/
+
+OP_TEST,/*	A C	if not (R(A) <=> C) then pc++			*/
+OP_TESTSET,/*	A B C	if (R(B) <=> C) then R(A) := R(B) else pc++	*/
+
+OP_CALL,/*	A B C	R(A), ... ,R(A+C-2) := R(A)(R(A+1), ... ,R(A+B-1)) */
+OP_TAILCALL,/*	A B C	return R(A)(R(A+1), ... ,R(A+B-1))		*/
+OP_RETURN,/*	A B	return R(A), ... ,R(A+B-2)	(see note)	*/
+
+OP_FORLOOP,/*	A sBx	R(A)+=R(A+2);
+			if R(A) <?= R(A+1) then { pc+=sBx; R(A+3)=R(A) }*/
+OP_FORPREP,/*	A sBx	R(A)-=R(A+2); pc+=sBx				*/
+
+OP_TFORCALL,/*	A C	R(A+3), ... ,R(A+2+C) := R(A)(R(A+1), R(A+2));	*/
+OP_TFORLOOP,/*	A sBx	if R(A+1) ~= nil then { R(A)=R(A+1); pc += sBx }*/
+
+OP_SETLIST,/*	A B C	R(A)[(C-1)*FPF+i] := R(A+i), 1 <= i <= B	*/
+
+OP_CLOSURE,/*	A Bx	R(A) := closure(KPROTO[Bx])			*/
+
+OP_VARARG,/*	A B	R(A), R(A+1), ..., R(A+B-2) = vararg		*/
+
+OP_EXTRAARG/*	Ax	extra (larger) argument for previous opcode	*/
+} OpCode;
+```
+
+Lua有47条操作码，具体的操作码和参数我们可以从上面的代码中看到，其中R(X)代表寄存器，Kst(x)代表常数（在常量表中的位置），RK(x)代表如果是常数的话则返回常数否则返回寄存器。
+
+#### 五、垃圾回收
+
+
+
