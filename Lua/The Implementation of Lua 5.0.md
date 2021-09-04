@@ -22,15 +22,7 @@ Lua具有8种基本的值类型：nil，boolean，number，string，table，func
 
 Lua将值表示成带标志的联合结构，即(t, v)对，其中t为整数，代表v的类型，v是C语言的一个union类型数据结构，储存有实际的值。
 
-源码：
-
-![TObject](pic\TObject.png)
-
 Value中n用于表示number（默认情况下，lua_Number被定义为double类型），b用于boolean，p用于light userdata，gc用于需要垃圾回收机制处理的其他值（string，table，function，heavy userdata，threads）。
-
-![GCObject](pic\GCObject.png)
-
-![GCHeader](pic\GCHeader.png)
 
 #### 三、表：
 
